@@ -3,20 +3,26 @@
 
 use std::future;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use bytes::Bytes;
 use http::Extensions;
+use http::header::{HeaderName, HeaderValue};
 use http_acl::utils::authority::{Authority, Host};
 use reqwest::{
-    Request, Response,
+    Body, Request, Response, ResponseBuilderExt,
     dns::{Name, Resolve, Resolving},
     redirect,
 };
 use reqwest_middleware::{Error, Middleware, Next};
 use thiserror::Error;
 
-pub use http_acl::{self, HttpAcl, HttpAclBuilder};
+pub use http_acl::{
+    self, HttpAcl, HttpAclBuilder, HttpAclHooks, ModifyRequestFn, ModifyResponseFn,
+    RequestMutation, ResponseMutation, ValidateFn,
+};
 
 #[derive(Debug, Clone)]
 /// A reqwest middleware that enforces an [`HttpAcl`].
@@ -28,6 +34,15 @@ pub use http_acl::{self, HttpAcl, HttpAclBuilder};
 /// `Client` as well, so domains are checked against the ACL as they resolve, and
 /// [`Self::redirect_policy`], so redirect targets are checked too. See the crate-level
 /// documentation for a full example wiring all three together.
+///
+/// If the `HttpAcl` has a `ModifyRequestFn` and/or `ModifyResponseFn` attached (see
+/// `HttpAclHooks`), those run too - a `ModifyRequestFn` once all the checks above
+/// pass and just before the request is sent, and a `ModifyResponseFn` on the way
+/// back, before the caller ever sees the `Response`. Neither is applied when not
+/// configured - see `HttpAcl::has_modify_request`/`has_modify_response`. A
+/// configured `ModifyResponseFn` forces the whole response body to be buffered and
+/// the response rebuilt from scratch; see the crate README for the performance
+/// trade-off.
 pub struct HttpAclMiddleware {
     acl: Arc<HttpAcl>,
 }
@@ -89,7 +104,17 @@ impl HttpAclMiddleware {
     /// Only the scheme, host/IP, port, and URL path of each redirect target can be
     /// checked this way - `reqwest`'s redirect policy does not expose the headers or
     /// body of the redirected request, so denied headers, denied bodies, and any custom
-    /// `validate_fn` are not re-evaluated per hop.
+    /// `validate_fn` are not re-evaluated per hop. `ModifyResponseFn` only ever sees
+    /// the final response of a redirect chain, never an intermediate `3xx`, for the
+    /// same reason.
+    ///
+    /// `ModifyRequestFn` is different: it's called once, against the original
+    /// outgoing request, before `Middleware::handle` hands it to `reqwest`, but a
+    /// header it injects is - like any header set before `send()` - carried forward
+    /// by `reqwest`'s own redirect handling to every subsequent hop (`reqwest` may
+    /// still strip specific headers, e.g. `Authorization`, when a redirect crosses
+    /// origins). So an injected header reaches the whole chain even though the
+    /// closure itself does not run again.
     pub fn redirect_policy(&self) -> redirect::Policy {
         self.redirect_policy_with_max(10)
     }
@@ -169,12 +194,15 @@ impl HttpAclMiddleware {
 impl Middleware for HttpAclMiddleware {
     async fn handle(
         &self,
-        req: Request,
+        mut req: Request,
         extensions: &mut Extensions,
         next: Next<'_>,
     ) -> std::result::Result<Response, Error> {
-        let scheme = req.url().scheme();
-        let acl_scheme_match = self.acl.is_scheme_allowed(scheme);
+        // Owned, rather than borrowed from `req.url()`, since it's still needed
+        // after `req` is moved into `next.run(...)` below (to check the response
+        // against `ModifyResponseFn`).
+        let scheme = req.url().scheme().to_string();
+        let acl_scheme_match = self.acl.is_scheme_allowed(&scheme);
         if acl_scheme_match.is_denied() {
             return Err(Error::Middleware(anyhow!(
                 "scheme {} is denied - {}",
@@ -262,7 +290,7 @@ impl Middleware for HttpAclMiddleware {
             }
 
             let valid_match = self.acl.is_valid(
-                scheme,
+                &scheme,
                 &authority,
                 req.headers()
                     .iter()
@@ -276,7 +304,88 @@ impl Middleware for HttpAclMiddleware {
                 )));
             }
 
-            next.run(req, extensions).await
+            if self.acl.has_modify_request() {
+                let mut mutation = RequestMutation {
+                    headers: req
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))
+                        })
+                        .collect(),
+                    body: req
+                        .body()
+                        .and_then(|b| b.as_bytes())
+                        .map(Bytes::copy_from_slice),
+                };
+                self.acl.modify_request(&scheme, &authority, &mut mutation);
+
+                req.headers_mut().clear();
+                for (name, value) in &mutation.headers {
+                    let header_name = HeaderName::from_str(name).map_err(|e| {
+                        Error::Middleware(anyhow!("invalid header name `{name}`: {e}"))
+                    })?;
+                    let header_value = HeaderValue::from_str(value).map_err(|e| {
+                        Error::Middleware(anyhow!("invalid header value for `{name}`: {e}"))
+                    })?;
+                    req.headers_mut().append(header_name, header_value);
+                }
+                if let Some(body) = mutation.body {
+                    *req.body_mut() = Some(Body::from(body));
+                }
+            }
+
+            let mut res = next.run(req, extensions).await?;
+
+            if self.acl.has_modify_response() {
+                let status = res.status();
+                let version = res.version();
+                let url = res.url().clone();
+                let extensions_snapshot = res.extensions().clone();
+                let headers: Vec<(String, String)> = res
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect();
+                // The point where the whole response body is buffered into memory -
+                // only reached when a `ModifyResponseFn` is actually configured.
+                let body = res.bytes().await?;
+
+                let mut mutation = ResponseMutation {
+                    status: status.as_u16(),
+                    headers,
+                    body,
+                };
+                self.acl.modify_response(&scheme, &authority, &mut mutation);
+
+                let mut builder = http::Response::builder()
+                    .status(mutation.status)
+                    .version(version);
+                for (name, value) in &mutation.headers {
+                    builder = builder.header(name.as_str(), value.as_str());
+                }
+                // `Response`'s own `Extensions` (distinct from the `extensions`
+                // parameter of this function) carries things like `HttpInfo`
+                // (backing `Response::remote_addr()`) - restore it here, before
+                // `.url(...)`, not after: `.url()` inserts its own extension entry,
+                // and a wholesale `*extensions_mut() = ...` afterwards would
+                // clobber that again.
+                if let Some(ext) = builder.extensions_mut() {
+                    *ext = extensions_snapshot;
+                }
+                let http_response = builder
+                    .url(url)
+                    .body(mutation.body)
+                    .map_err(|e| Error::Middleware(anyhow!("failed to rebuild response: {e}")))?;
+                res = Response::from(http_response);
+            }
+
+            Ok(res)
         } else {
             return Err(Error::Middleware(anyhow!("missing host")));
         }
@@ -634,5 +743,323 @@ mod tests {
             .await;
 
         assert!(request.is_err());
+    }
+
+    #[test]
+    fn test_no_hooks_configured_leaves_acl_unaffected() {
+        let acl = HttpAcl::builder().build();
+
+        assert!(!acl.has_modify_request());
+        assert!(!acl.has_modify_response());
+    }
+
+    #[tokio::test]
+    async fn test_modify_request_injects_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let _ = captured_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let acl = HttpAcl::builder()
+            .non_global_ip_ranges(true)
+            .ip_acl_default(true)
+            .port_acl_default(true)
+            .host_acl_default(true)
+            .build_full(HttpAclHooks {
+                modify_request_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+                    mutation
+                        .headers
+                        .push(("x-injected-secret".to_string(), "sssh".to_string()));
+                })),
+                ..Default::default()
+            });
+
+        let middleware = HttpAclMiddleware::new(acl);
+
+        let client = reqwest_middleware::ClientBuilder::new(
+            reqwest::Client::builder()
+                .dns_resolver(middleware.dns_resolver())
+                .build()
+                .unwrap(),
+        )
+        .with(middleware)
+        .build();
+
+        let request = client
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .send()
+            .await;
+
+        assert!(request.is_ok(), "{:?}", request.err());
+        let captured = captured_rx.await.unwrap();
+        assert!(
+            captured.to_lowercase().contains("x-injected-secret: sssh"),
+            "captured request did not contain the injected header:\n{captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_request_replaces_body_and_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let _ = captured_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let new_body = "a much longer replacement body than the original";
+        let acl = HttpAcl::builder()
+            .non_global_ip_ranges(true)
+            .ip_acl_default(true)
+            .port_acl_default(true)
+            .host_acl_default(true)
+            .build_full(HttpAclHooks {
+                modify_request_fn: Some(Arc::new(move |_scheme, _authority, mutation| {
+                    mutation.body = Some(Bytes::from(new_body));
+                })),
+                ..Default::default()
+            });
+
+        let middleware = HttpAclMiddleware::new(acl);
+
+        let client = reqwest_middleware::ClientBuilder::new(
+            reqwest::Client::builder()
+                .dns_resolver(middleware.dns_resolver())
+                .build()
+                .unwrap(),
+        )
+        .with(middleware)
+        .build();
+
+        let request = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .body("short")
+            .send()
+            .await;
+
+        assert!(request.is_ok(), "{:?}", request.err());
+        let captured = captured_rx.await.unwrap();
+        assert!(
+            captured.contains(&format!("content-length: {}", new_body.len()))
+                || captured.contains(&format!("Content-Length: {}", new_body.len())),
+            "captured request did not have a Content-Length matching the replaced body:\n{captured}"
+        );
+        assert!(
+            captured.ends_with(new_body),
+            "captured request did not end with the replaced body:\n{captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_response_rewrites_status_headers_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = "original body";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nx-remove-me: yes\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let acl = HttpAcl::builder()
+            .non_global_ip_ranges(true)
+            .ip_acl_default(true)
+            .port_acl_default(true)
+            .host_acl_default(true)
+            .build_full(HttpAclHooks {
+                modify_response_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+                    mutation.status = 201;
+                    mutation.headers.retain(|(k, _)| k != "x-remove-me");
+                    mutation
+                        .headers
+                        .push(("x-added".to_string(), "yes".to_string()));
+                    mutation.body = Bytes::from_static(b"redacted body");
+                })),
+                ..Default::default()
+            });
+
+        let middleware = HttpAclMiddleware::new(acl);
+
+        let client = reqwest_middleware::ClientBuilder::new(
+            reqwest::Client::builder()
+                .dns_resolver(middleware.dns_resolver())
+                .build()
+                .unwrap(),
+        )
+        .with(middleware)
+        .build();
+
+        let response = client
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 201);
+        assert!(!response.headers().contains_key("x-remove-me"));
+        assert_eq!(response.headers().get("x-added").unwrap(), "yes");
+        let body = response.text().await.unwrap();
+        assert_eq!(body, "redacted body");
+    }
+
+    #[tokio::test]
+    async fn test_modify_response_preserves_url_and_remote_addr() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let acl = HttpAcl::builder()
+            .non_global_ip_ranges(true)
+            .ip_acl_default(true)
+            .port_acl_default(true)
+            .host_acl_default(true)
+            .build_full(HttpAclHooks {
+                modify_response_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+                    mutation.body = Bytes::from_static(b"changed");
+                })),
+                ..Default::default()
+            });
+
+        let middleware = HttpAclMiddleware::new(acl);
+
+        let client = reqwest_middleware::ClientBuilder::new(
+            reqwest::Client::builder()
+                .dns_resolver(middleware.dns_resolver())
+                .build()
+                .unwrap(),
+        )
+        .with(middleware)
+        .build();
+
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let response = client.get(&url).send().await.unwrap();
+
+        assert_eq!(response.url().as_str(), url);
+        assert!(
+            response.remote_addr().is_some(),
+            "remote_addr() was lost when the response was rebuilt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_request_header_carries_through_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second_listener.local_addr().unwrap();
+
+        let (second_captured_tx, second_captured_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = second_listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let _ = second_captured_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = first_listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/\r\nContent-Length: 0\r\n\r\n",
+                    second_addr.port()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let acl = HttpAcl::builder()
+            .non_global_ip_ranges(true)
+            .ip_acl_default(true)
+            .port_acl_default(true)
+            .host_acl_default(true)
+            .build_full(HttpAclHooks {
+                modify_request_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+                    mutation
+                        .headers
+                        .push(("x-marker".to_string(), "hop-one-only".to_string()));
+                })),
+                ..Default::default()
+            });
+
+        let middleware = HttpAclMiddleware::new(acl);
+
+        let client = reqwest_middleware::ClientBuilder::new(
+            reqwest::Client::builder()
+                .dns_resolver(middleware.dns_resolver())
+                .redirect(middleware.redirect_policy())
+                .build()
+                .unwrap(),
+        )
+        .with(middleware)
+        .build();
+
+        let request = client
+            .get(format!("http://127.0.0.1:{}/", first_addr.port()))
+            .send()
+            .await;
+
+        assert!(request.is_ok(), "{:?}", request.err());
+        let second_captured = second_captured_rx.await.unwrap();
+        // `ModifyRequestFn` only ever runs once, against the original request, but
+        // `reqwest`'s own redirect handling carries a header set before `send()`
+        // (which is indistinguishable from one injected by the closure) forward to
+        // every hop - the header shows up here even though the closure itself
+        // never ran again. See the `redirect_policy` doc comment.
+        assert!(
+            second_captured.to_lowercase().contains("x-marker"),
+            "expected the header injected for the original request to carry through \
+             reqwest's redirect handling to the second hop, but it did not:\n{second_captured}"
+        );
     }
 }

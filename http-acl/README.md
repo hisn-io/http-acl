@@ -10,7 +10,7 @@ This crate provides a simple ACL to allow you to specify which hosts, ports, and
 
 ## What it checks
 
-An `HttpAcl` can check a request's scheme, method, host, port, IP, headers, and URL path, plus any custom logic you supply as a `ValidateFn`. Each of these (other than scheme, which is a simple allow/deny flag per protocol) is evaluated the same way: the allow list is checked first, then the deny list, and if neither matches, a per-category default decides the outcome. Methods, hosts, ports, and IPs deny by default; headers and URL paths allow by default. Every check returns an `AclClassification` rather than a plain boolean, so you can see why a request was allowed or denied, not just whether it was; call `.is_allowed()`/`.is_denied()` on it once only the outcome matters.
+An `HttpAcl` can check a request's scheme, method, host, port, IP, headers, and URL path, plus any custom logic you supply as a `ValidateFn`, and optionally mutate the request/response themselves via a `ModifyRequestFn`/`ModifyResponseFn` (see [Modifying requests and responses](#modifying-requests-and-responses) below). Each of these (other than scheme, which is a simple allow/deny flag per protocol) is evaluated the same way: the allow list is checked first, then the deny list, and if neither matches, a per-category default decides the outcome. Methods, hosts, ports, and IPs deny by default; headers and URL paths allow by default. Every check returns an `AclClassification` rather than a plain boolean, so you can see why a request was allowed or denied, not just whether it was; call `.is_allowed()`/`.is_denied()` on it once only the outcome matters.
 
 Non-global IP addresses (private, loopback, link-local, and other special-use ranges) are denied outright regardless of the IP allow/deny lists, unless you opt in with `.non_global_ip_ranges(true)` on the builder.
 
@@ -68,6 +68,41 @@ Allow-list entries (including wildcard ones) are always checked before deny-list
 ## Static DNS mappings
 
 A host can be pinned to a fixed address with `add_static_dns_mapping`, or `add_trusted_static_dns_mapping` if that address should bypass the IP/port ACL entirely. This is enforced by whichever DNS resolver a consuming crate wires up (e.g. `http-acl-reqwest`'s); `http-acl` itself only holds the mappings and exposes `resolve_static_dns_mapping`/`resolve_trusted_static_dns_mapping` for a consumer to look them up.
+
+## Modifying requests and responses
+
+Beyond checking a request, an `HttpAcl` can also carry a `ModifyRequestFn` and a `ModifyResponseFn`. Neither is about allow/deny - they run after the ACL has already decided a request is allowed, and let you rewrite it (or its response) instead. Typical uses:
+
+- **Injecting secrets.** Attach an API key, bearer token, or signature header to every outgoing request without the caller having to know about it or being able to see, override, or leak it themselves - handy when the request is built from untrusted input (e.g. a user-supplied webhook URL) but the credential belongs to your service, not the caller.
+- **Adding operational headers.** Stamp a request ID, tracing header, or `User-Agent` onto every outgoing request centrally, rather than at every call site.
+- **Sanitising requests before they leave.** Strip a header a caller set that shouldn't reach the destination (distinct from denying the header outright via `add_denied_header`, which rejects the whole request - a `ModifyRequestFn` lets the request through with the header quietly removed instead).
+- **Redacting responses.** Strip `Set-Cookie` or other sensitive response headers before they reach application code, or scrub a field out of a JSON response body, so a caller several layers away from the network call never sees it.
+- **Normalising responses.** Rewrite an upstream's non-standard status code or error body into something the rest of your application expects, in one place rather than at every call site.
+
+Both hooks are attached the same way as `ValidateFn` - via `HttpAclBuilder::build_full`/`try_build_full`'s `HttpAclHooks` argument, not a dedicated setter - since they're typically closures capturing state from outside the builder (a secret, a request-scoped ID generator, and so on):
+
+```rust
+use http_acl::{HttpAcl, HttpAclHooks};
+use std::sync::Arc;
+
+let api_key = "super-secret-api-key".to_string();
+
+let acl = HttpAcl::builder().build_full(HttpAclHooks {
+    // Inject a secret the caller never sees or controls.
+    modify_request_fn: Some(Arc::new(move |_scheme, _authority, mutation| {
+        mutation
+            .headers
+            .push(("x-api-key".to_string(), api_key.clone()));
+    })),
+    // Strip a header before the caller ever sees the response.
+    modify_response_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+        mutation.headers.retain(|(name, _)| name != "set-cookie");
+    })),
+    ..Default::default()
+});
+```
+
+Check `HttpAcl::has_modify_request`/`has_modify_response` before doing any work to make a request/response available for mutation (e.g. buffering a body): a consuming crate should skip that work entirely when the corresponding hook isn't configured, so the feature costs nothing unless you use it. [`http-acl-reqwest`](https://docs.rs/http-acl-reqwest) does exactly this - see its README for the concrete performance trade-off of enabling `ModifyResponseFn`, and for more end-to-end examples.
 
 ## Integrating with a different HTTP client
 

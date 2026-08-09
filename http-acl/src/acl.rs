@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::AddError,
+    mutation::{ModifyRequestFn, ModifyResponseFn, RequestMutation, ResponseMutation},
     utils::{
         self, IntoIpRange,
         authority::Authority,
@@ -84,6 +85,8 @@ pub struct HttpAcl {
     allowed_url_paths_router: Router<()>,
     denied_url_paths_router: Router<()>,
     validate_fn: Option<ValidateFn>,
+    modify_request_fn: Option<ModifyRequestFn>,
+    modify_response_fn: Option<ModifyResponseFn>,
     allow_non_global_ip_ranges: bool,
     method_acl_default: bool,
     host_acl_default: bool,
@@ -187,6 +190,8 @@ impl std::default::Default for HttpAcl {
             allowed_url_paths_router: Router::new(),
             denied_url_paths_router: Router::new(),
             validate_fn: None,
+            modify_request_fn: None,
+            modify_response_fn: None,
             allow_non_global_ip_ranges: false,
             method_acl_default: false,
             host_acl_default: false,
@@ -371,6 +376,53 @@ impl HttpAcl {
         }
     }
 
+    /// Returns whether a [`ModifyRequestFn`] is attached to this ACL.
+    ///
+    /// Cheap (a single field read). Check this before doing any work to make a
+    /// request's body/headers available for mutation (e.g. buffering a streaming
+    /// body), so that omitting a `ModifyRequestFn` costs nothing at request time.
+    pub fn has_modify_request(&self) -> bool {
+        self.modify_request_fn.is_some()
+    }
+
+    /// Returns whether a [`ModifyResponseFn`] is attached to this ACL.
+    ///
+    /// See [`Self::has_modify_request`] - same rationale, for the response side.
+    pub fn has_modify_response(&self) -> bool {
+        self.modify_response_fn.is_some()
+    }
+
+    /// Runs the [`ModifyRequestFn`] attached to this ACL, if any, against
+    /// `mutation`, mutating it in place.
+    ///
+    /// Does nothing when no `ModifyRequestFn` was attached, so calling this is
+    /// always safe even if you never configured one - though see
+    /// [`Self::has_modify_request`] if you want to skip preparing `mutation` at all
+    /// in that case.
+    pub fn modify_request(
+        &self,
+        scheme: &str,
+        authority: &Authority,
+        mutation: &mut RequestMutation,
+    ) {
+        if let Some(modify_request_fn) = &self.modify_request_fn {
+            modify_request_fn(scheme, authority, mutation);
+        }
+    }
+
+    /// Runs the [`ModifyResponseFn`] attached to this ACL, if any, against
+    /// `mutation`, mutating it in place. See [`Self::modify_request`].
+    pub fn modify_response(
+        &self,
+        scheme: &str,
+        authority: &Authority,
+        mutation: &mut ResponseMutation,
+    ) {
+        if let Some(modify_response_fn) = &self.modify_response_fn {
+            modify_response_fn(scheme, authority, mutation);
+        }
+    }
+
     /// Checks if an ip is in a list of ip ranges.
     fn is_ip_in_ranges(ip: &IpAddr, ranges: &[RangeInclusive<IpAddr>]) -> bool {
         ranges.iter().any(|range| range.contains(ip))
@@ -515,6 +567,23 @@ impl HttpRequestMethod {
             HttpRequestMethod::OTHER(other) => other,
         }
     }
+}
+
+/// The runtime hooks attached to an [`HttpAcl`] at build time, via
+/// [`HttpAclBuilder::build_full`]/[`HttpAclBuilder::try_build_full`].
+///
+/// Each field is typically a closure that captures state from outside the builder
+/// (a database handle, a secret, and so on), which is why these aren't set through
+/// dedicated builder setter methods the way most of [`HttpAclBuilder`]'s other
+/// configuration is.
+#[derive(Clone, Default)]
+pub struct HttpAclHooks {
+    /// See [`ValidateFn`].
+    pub validate_fn: Option<ValidateFn>,
+    /// See [`ModifyRequestFn`].
+    pub modify_request_fn: Option<ModifyRequestFn>,
+    /// See [`ModifyResponseFn`].
+    pub modify_response_fn: Option<ModifyResponseFn>,
 }
 
 /// A builder for [`HttpAcl`].
@@ -1568,22 +1637,23 @@ impl HttpAclBuilder {
         self
     }
 
-    /// Builds the [`HttpAcl`], without a [`ValidateFn`].
+    /// Builds the [`HttpAcl`], without any [`HttpAclHooks`] attached.
     ///
     /// This does not validate the configuration (uniqueness, overlaps, non-global IP
     /// ranges); use [`Self::try_build`] instead if the builder wasn't assembled
     /// entirely through this type's own fallible `add_*`/`allowed_*`/`denied_*`
     /// methods, e.g. if it was deserialized. See [`Self::try_build`] for details.
     pub fn build(self) -> HttpAcl {
-        self.build_full(None)
+        self.build_full(HttpAclHooks::default())
     }
 
-    /// Builds the [`HttpAcl`] with a [`ValidateFn`] attached.
+    /// Builds the [`HttpAcl`] with the given [`HttpAclHooks`] attached.
     ///
-    /// This is the only way to attach a `ValidateFn`; there is no dedicated builder
-    /// setter for it. Like [`Self::build`], this does not validate the configuration;
-    /// use [`Self::try_build_full`] for that.
-    pub fn build_full(self, validate_fn: Option<ValidateFn>) -> HttpAcl {
+    /// This is the only way to attach a `ValidateFn`, `ModifyRequestFn`, or
+    /// `ModifyResponseFn`; there is no dedicated builder setter for any of them.
+    /// Like [`Self::build`], this does not validate the configuration; use
+    /// [`Self::try_build_full`] for that.
+    pub fn build_full(self, hooks: HttpAclHooks) -> HttpAcl {
         HttpAcl {
             allow_http: self.allow_http,
             allow_https: self.allow_https,
@@ -1629,7 +1699,9 @@ impl HttpAclBuilder {
                 .into_iter()
                 .map(|(k, v)| (k.into_boxed_str(), v))
                 .collect(),
-            validate_fn,
+            validate_fn: hooks.validate_fn,
+            modify_request_fn: hooks.modify_request_fn,
+            modify_response_fn: hooks.modify_response_fn,
             allow_non_global_ip_ranges: self.allow_non_global_ip_ranges,
             method_acl_default: self.method_acl_default,
             host_acl_default: self.host_acl_default,
@@ -1640,8 +1712,8 @@ impl HttpAclBuilder {
         }
     }
 
-    /// Builds the [`HttpAcl`] with a [`ValidateFn`] attached, validating the
-    /// configuration first.
+    /// Builds the [`HttpAcl`] with the given [`HttpAclHooks`] attached, validating
+    /// the configuration first.
     ///
     /// Checks each category for unique entries, non-overlapping ranges, and no host
     /// (or port range, IP range, header, and so on) present on both the allowed and
@@ -1656,7 +1728,7 @@ impl HttpAclBuilder {
     /// and bypasses the checks each `add_*` method normally performs, so this is also
     /// what rebuilds the URL path routers and wildcard host patterns skipped for that
     /// reason.
-    pub fn try_build_full(mut self, validate_fn: Option<ValidateFn>) -> Result<HttpAcl, AddError> {
+    pub fn try_build_full(mut self, hooks: HttpAclHooks) -> Result<HttpAcl, AddError> {
         if !utils::has_unique_elements(&self.allowed_methods) {
             return Err(AddError::NotUnique(
                 "Allowed methods must be unique.".to_string(),
@@ -1879,13 +1951,13 @@ impl HttpAclBuilder {
                     })?;
             }
         }
-        Ok(self.build_full(validate_fn))
+        Ok(self.build_full(hooks))
     }
 
-    /// Builds the [`HttpAcl`], without a [`ValidateFn`], validating the
-    /// configuration first. See [`Self::try_build_full`] for what is validated and
-    /// when to prefer this over [`Self::build`].
+    /// Builds the [`HttpAcl`], without any [`HttpAclHooks`] attached, validating
+    /// the configuration first. See [`Self::try_build_full`] for what is validated
+    /// and when to prefer this over [`Self::build`].
     pub fn try_build(self) -> Result<HttpAcl, AddError> {
-        self.try_build_full(None)
+        self.try_build_full(HttpAclHooks::default())
     }
 }

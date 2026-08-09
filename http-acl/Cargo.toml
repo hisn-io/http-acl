@@ -10,6 +10,7 @@ categories.workspace = true
 keywords.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 hashbrown = { workspace = true, optional = true }
 ipnet = { workspace = true }
 matchit = { workspace = true }

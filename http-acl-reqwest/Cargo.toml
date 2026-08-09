@@ -10,10 +10,11 @@ categories.workspace = true
 keywords.workspace = true
 
 [dependencies]
-http-acl = { path = "../http-acl", version = "0.12.0" }
+http-acl = { path = "../http-acl", version = "0.13.0" }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
 reqwest = { workspace = true }

@@ -5,9 +5,13 @@ pub use ipnet::IpNet;
 
 pub mod acl;
 pub mod error;
+pub mod mutation;
 pub mod utils;
 
-pub use acl::{AclClassification, HttpAcl, HttpAclBuilder, HttpRequestMethod};
+pub use acl::{
+    AclClassification, HttpAcl, HttpAclBuilder, HttpAclHooks, HttpRequestMethod, ValidateFn,
+};
+pub use mutation::{ModifyRequestFn, ModifyResponseFn, RequestMutation, ResponseMutation};
 pub use utils::IntoIpRange;
 
 #[cfg(test)]
@@ -17,7 +21,7 @@ mod tests {
 
     use ipnet::IpNet;
 
-    use super::{AclClassification, HttpAclBuilder};
+    use super::{AclClassification, HttpAclBuilder, HttpAclHooks};
 
     #[test]
     fn acl() {
@@ -313,29 +317,34 @@ mod tests {
     #[test]
     fn valid_acl() {
         let acl = HttpAclBuilder::new()
-            .try_build_full(Some(Arc::new(|scheme, authority, headers, body| {
-                if scheme == "http" {
-                    return AclClassification::DeniedUserAcl;
-                }
-
-                if authority.host.is_ip() {
-                    return AclClassification::DeniedUserAcl;
-                }
-
-                for (header_name, header_value) in headers {
-                    if header_name == "<dangerous-header>" && header_value == "<dangerous-value>" {
+            .try_build_full(HttpAclHooks {
+                validate_fn: Some(Arc::new(|scheme, authority, headers, body| {
+                    if scheme == "http" {
                         return AclClassification::DeniedUserAcl;
                     }
-                }
 
-                if let Some(body) = body
-                    && body == b"<dangerous-body>"
-                {
-                    return AclClassification::DeniedUserAcl;
-                }
+                    if authority.host.is_ip() {
+                        return AclClassification::DeniedUserAcl;
+                    }
 
-                AclClassification::AllowedDefault
-            })))
+                    for (header_name, header_value) in headers {
+                        if header_name == "<dangerous-header>"
+                            && header_value == "<dangerous-value>"
+                        {
+                            return AclClassification::DeniedUserAcl;
+                        }
+                    }
+
+                    if let Some(body) = body
+                        && body == b"<dangerous-body>"
+                    {
+                        return AclClassification::DeniedUserAcl;
+                    }
+
+                    AclClassification::AllowedDefault
+                })),
+                ..Default::default()
+            })
             .unwrap();
 
         assert!(
@@ -383,5 +392,74 @@ mod tests {
             )
             .is_denied()
         );
+    }
+
+    #[test]
+    fn modify_hooks_unset_by_default() {
+        let acl = HttpAclBuilder::new().build();
+
+        assert!(!acl.has_modify_request());
+        assert!(!acl.has_modify_response());
+
+        let mut request_mutation = super::RequestMutation::default();
+        acl.modify_request("https", &"example.com".into(), &mut request_mutation);
+        assert_eq!(request_mutation, super::RequestMutation::default());
+
+        let mut response_mutation = super::ResponseMutation {
+            status: 200,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: bytes::Bytes::from_static(b"body"),
+        };
+        let unchanged = response_mutation.clone();
+        acl.modify_response("https", &"example.com".into(), &mut response_mutation);
+        assert_eq!(response_mutation, unchanged);
+    }
+
+    #[test]
+    fn modify_hooks_invoked_with_expected_context() {
+        let acl = HttpAclBuilder::new().build_full(HttpAclHooks {
+            modify_request_fn: Some(std::sync::Arc::new(|scheme, authority, mutation| {
+                mutation
+                    .headers
+                    .push(("x-injected".to_string(), format!("{scheme}://{authority}")));
+                mutation.body = Some(bytes::Bytes::from_static(b"replaced"));
+            })),
+            modify_response_fn: Some(std::sync::Arc::new(|scheme, authority, mutation| {
+                mutation.status = 201;
+                mutation.headers.retain(|(k, _)| k != "x-remove-me");
+                mutation.body = bytes::Bytes::from(format!("{scheme}://{authority}"));
+            })),
+            ..Default::default()
+        });
+
+        assert!(acl.has_modify_request());
+        assert!(acl.has_modify_response());
+
+        let mut request_mutation = super::RequestMutation::default();
+        acl.modify_request("https", &"example.com".into(), &mut request_mutation);
+        assert_eq!(
+            request_mutation.headers,
+            vec![("x-injected".to_string(), "https://example.com".to_string())]
+        );
+        assert_eq!(
+            request_mutation.body,
+            Some(bytes::Bytes::from_static(b"replaced"))
+        );
+
+        let mut response_mutation = super::ResponseMutation {
+            status: 200,
+            headers: vec![
+                ("x-remove-me".to_string(), "yes".to_string()),
+                ("x-keep-me".to_string(), "yes".to_string()),
+            ],
+            body: bytes::Bytes::new(),
+        };
+        acl.modify_response("https", &"example.com".into(), &mut response_mutation);
+        assert_eq!(response_mutation.status, 201);
+        assert_eq!(
+            response_mutation.headers,
+            vec![("x-keep-me".to_string(), "yes".to_string())]
+        );
+        assert_eq!(response_mutation.body, "https://example.com");
     }
 }

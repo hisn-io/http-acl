@@ -3,7 +3,7 @@ members = ["http-acl", "http-acl-reqwest"]
 resolver = "2"
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/nethunterslabs/http-acl"
@@ -13,6 +13,7 @@ keywords = ["http", "acl", "ip", "network", "ssrf"]
 [workspace.dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.91"
+bytes = "1.12.1"
 hashbrown = { version = "0.17.1", features = ["inline-more", "serde"] }
 http = "1.5.0"
 ipnet = "2.12.1"
