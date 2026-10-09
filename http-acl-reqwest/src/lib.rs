@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
+use std::borrow::Cow;
 use std::future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
@@ -43,6 +44,12 @@ pub use http_acl::{
 /// configured `ModifyResponseFn` forces the whole response body to be buffered and
 /// the response rebuilt from scratch; see the crate README for the performance
 /// trade-off.
+///
+/// Header values that are not valid UTF-8 (`obs-text` bytes 0x80-0xFF) are not
+/// refused. The header ACL compares them as raw bytes
+/// (`HttpAcl::is_header_allowed_bytes`); a `ValidateFn` and the mutation hooks see
+/// them lossily decoded (U+FFFD), and a value a hook leaves unchanged is sent or
+/// returned with its original bytes.
 pub struct HttpAclMiddleware {
     acl: Arc<HttpAcl>,
 }
@@ -259,17 +266,18 @@ impl Middleware for HttpAclMiddleware {
                 }
             }
 
+            // Header values may carry obs-text bytes (0x80-0xFF) that are not valid
+            // UTF-8, so they are checked as raw bytes rather than refused.
             for (key, value) in req.headers() {
                 let header_name = key.as_str();
-                let header_value = value.to_str().map_err(|_| {
-                    Error::Middleware(anyhow!("invalid header value for {}", header_name))
-                })?;
-                let acl_header_match = self.acl.is_header_allowed(header_name, header_value);
+                let acl_header_match = self
+                    .acl
+                    .is_header_allowed_bytes(header_name, value.as_bytes());
                 if acl_header_match.is_denied() {
                     return Err(Error::Middleware(anyhow!(
                         "header {}: {} is denied - {}",
                         header_name,
-                        header_value,
+                        header_value_lossy(value),
                         acl_header_match
                     )));
                 }
@@ -289,12 +297,18 @@ impl Middleware for HttpAclMiddleware {
                 )));
             }
 
+            // Every header reaches the `ValidateFn`, a non-UTF-8 value lossily
+            // decoded, so a custom check keyed on a header cannot be bypassed by
+            // putting obs-text bytes in it.
+            let lossy_headers: Vec<(&str, Cow<'_, str>)> = req
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str(), header_value_lossy(v)))
+                .collect();
             let valid_match = self.acl.is_valid(
                 &scheme,
                 &authority,
-                req.headers()
-                    .iter()
-                    .filter_map(|(k, v)| Some((k.as_str(), v.to_str().ok()?))),
+                lossy_headers.iter().map(|(k, v)| (*k, v.as_ref())),
                 req.body().and_then(|b| b.as_bytes()),
             );
             if valid_match.is_denied() {
@@ -305,14 +319,9 @@ impl Middleware for HttpAclMiddleware {
             }
 
             if self.acl.has_modify_request() {
+                let (headers, mut raw_headers) = mutation_headers(req.headers());
                 let mut mutation = RequestMutation {
-                    headers: req
-                        .headers()
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))
-                        })
-                        .collect(),
+                    headers,
                     body: req
                         .body()
                         .and_then(|b| b.as_bytes())
@@ -325,9 +334,12 @@ impl Middleware for HttpAclMiddleware {
                     let header_name = HeaderName::from_str(name).map_err(|e| {
                         Error::Middleware(anyhow!("invalid header name `{name}`: {e}"))
                     })?;
-                    let header_value = HeaderValue::from_str(value).map_err(|e| {
-                        Error::Middleware(anyhow!("invalid header value for `{name}`: {e}"))
-                    })?;
+                    let header_value = match take_raw_header(&mut raw_headers, name, value) {
+                        Some(raw) => raw,
+                        None => HeaderValue::from_str(value).map_err(|e| {
+                            Error::Middleware(anyhow!("invalid header value for `{name}`: {e}"))
+                        })?,
+                    };
                     req.headers_mut().append(header_name, header_value);
                 }
                 if let Some(body) = mutation.body {
@@ -342,16 +354,7 @@ impl Middleware for HttpAclMiddleware {
                 let version = res.version();
                 let url = res.url().clone();
                 let extensions_snapshot = res.extensions().clone();
-                let headers: Vec<(String, String)> = res
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.as_str().to_string(),
-                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
-                        )
-                    })
-                    .collect();
+                let (headers, mut raw_headers) = mutation_headers(res.headers());
                 // The point where the whole response body is buffered into memory -
                 // only reached when a `ModifyResponseFn` is actually configured.
                 let body = res.bytes().await?;
@@ -367,7 +370,10 @@ impl Middleware for HttpAclMiddleware {
                     .status(mutation.status)
                     .version(version);
                 for (name, value) in &mutation.headers {
-                    builder = builder.header(name.as_str(), value.as_str());
+                    builder = match take_raw_header(&mut raw_headers, name, value) {
+                        Some(raw) => builder.header(name.as_str(), raw),
+                        None => builder.header(name.as_str(), value.as_str()),
+                    };
                 }
                 // `Response`'s own `Extensions` (distinct from the `extensions`
                 // parameter of this function) carries things like `HttpInfo`
@@ -390,6 +396,45 @@ impl Middleware for HttpAclMiddleware {
             return Err(Error::Middleware(anyhow!("missing host")));
         }
     }
+}
+
+/// Decodes a header value for the `&str`-based ACL hooks: exact for UTF-8, lossy
+/// (U+FFFD) for obs-text bytes that are not valid UTF-8.
+fn header_value_lossy(value: &HeaderValue) -> Cow<'_, str> {
+    String::from_utf8_lossy(value.as_bytes())
+}
+
+/// A header whose value is not valid UTF-8: its name, its lossy decode as handed
+/// to a mutation hook, and its original bytes.
+type RawHeader = (String, String, HeaderValue);
+
+/// Builds the `(name, value)` list handed to a mutation hook, plus the original
+/// bytes of every value that could only be decoded lossily, so a header the hook
+/// leaves untouched goes back out with its bytes unchanged rather than dropped or
+/// rewritten as U+FFFD.
+fn mutation_headers(headers: &http::HeaderMap) -> (Vec<(String, String)>, Vec<RawHeader>) {
+    let mut raw = Vec::new();
+    let list = headers
+        .iter()
+        .map(|(k, v)| {
+            let name = k.as_str().to_string();
+            let value = header_value_lossy(v).into_owned();
+            if std::str::from_utf8(v.as_bytes()).is_err() {
+                raw.push((name.clone(), value.clone(), v.clone()));
+            }
+            (name, value)
+        })
+        .collect();
+    (list, raw)
+}
+
+/// Returns (and consumes) the original bytes of a header the hook left as it was
+/// given, matched on name and lossy value.
+fn take_raw_header(raw: &mut Vec<RawHeader>, name: &str, value: &str) -> Option<HeaderValue> {
+    let index = raw
+        .iter()
+        .position(|(n, v, _)| n.eq_ignore_ascii_case(name) && v == value)?;
+    Some(raw.remove(index).2)
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -520,6 +565,8 @@ pub enum HttpAclError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_acl::acl::AclClassification;
+    use reqwest_middleware::ClientWithMiddleware;
 
     #[tokio::test]
     async fn test_http_acl_middleware() {
@@ -1061,5 +1108,221 @@ mod tests {
             "expected the header injected for the original request to carry through \
              reqwest's redirect handling to the second hop, but it did not:\n{second_captured}"
         );
+    }
+
+    /// Accepts one connection, captures the raw request bytes, and answers with
+    /// `response`.
+    async fn capture_server(
+        response: &'static [u8],
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let _ = captured_tx.send(buf[..n].to_ascii_lowercase());
+                let _ = socket.write_all(response).await;
+            }
+        });
+        (addr, captured_rx)
+    }
+
+    fn local_client(hooks: HttpAclHooks, builder: HttpAclBuilder) -> ClientWithMiddleware {
+        let acl = builder
+            .non_global_ip_ranges(true)
+            .ip_acl_default(true)
+            .port_acl_default(true)
+            .host_acl_default(true)
+            .build_full(hooks);
+        let middleware = HttpAclMiddleware::new(acl);
+        reqwest_middleware::ClientBuilder::new(
+            reqwest::Client::builder()
+                .dns_resolver(middleware.dns_resolver())
+                .build()
+                .unwrap(),
+        )
+        .with(middleware)
+        .build()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    const OK_EMPTY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    #[tokio::test]
+    async fn test_obs_text_header_values_are_sent_unchanged() {
+        let (addr, captured_rx) = capture_server(OK_EMPTY).await;
+        let client = local_client(HttpAclHooks::default(), HttpAcl::builder());
+
+        let request = client
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .header("cookie", HeaderValue::from_bytes(b"a=caf\xE9").unwrap())
+            .header("user-agent", HeaderValue::from_bytes(b"caf\xE9").unwrap())
+            .send()
+            .await;
+
+        assert!(request.is_ok(), "{:?}", request.err());
+        let captured = captured_rx.await.unwrap();
+        assert!(
+            contains(&captured, b"cookie: a=caf\xE9\r\n"),
+            "{captured:?}"
+        );
+        assert!(
+            contains(&captured, b"user-agent: caf\xE9\r\n"),
+            "{captured:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_denied_header_with_obs_text_value_is_still_denied() {
+        let client = local_client(
+            HttpAclHooks::default(),
+            HttpAcl::builder()
+                .add_denied_header("cookie".to_string(), None)
+                .unwrap(),
+        );
+
+        let request = client
+            .get("http://127.0.0.1:9/")
+            .header("cookie", HeaderValue::from_bytes(b"a=caf\xE9").unwrap())
+            .send()
+            .await;
+
+        let error = request.unwrap_err().to_string();
+        assert!(error.starts_with("header cookie: "), "{error}");
+        assert!(error.contains("is denied"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_allowed_header_value_is_compared_as_raw_bytes() {
+        // A lossy decode turns 0xE9 into U+FFFD, so comparing lossily would let
+        // `caf\xE9` match an allow-listed `caf\u{FFFD}`.
+        let builder = || {
+            HttpAcl::builder()
+                .add_allowed_header("x-token".to_string(), Some("caf\u{FFFD}".to_string()))
+                .unwrap()
+        };
+
+        let client = local_client(HttpAclHooks::default(), builder());
+        let request = client
+            .get("http://127.0.0.1:9/")
+            .header("x-token", HeaderValue::from_bytes(b"caf\xE9").unwrap())
+            .send()
+            .await;
+        let error = request.unwrap_err().to_string();
+        assert!(error.starts_with("header x-token: "), "{error}");
+
+        let (addr, captured_rx) = capture_server(OK_EMPTY).await;
+        let client = local_client(HttpAclHooks::default(), builder());
+        let request = client
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .header(
+                "x-token",
+                HeaderValue::from_bytes("caf\u{FFFD}".as_bytes()).unwrap(),
+            )
+            .send()
+            .await;
+        assert!(request.is_ok(), "{:?}", request.err());
+        let captured = captured_rx.await.unwrap();
+        assert!(
+            contains(&captured, "x-token: caf\u{FFFD}\r\n".as_bytes()),
+            "{captured:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_fn_sees_obs_text_headers() {
+        // A `ValidateFn` must not have an obs-text header hidden from it, or a
+        // custom denial keyed on that header could be bypassed.
+        let client = local_client(
+            HttpAclHooks {
+                validate_fn: Some(Arc::new(|_scheme, _authority, mut headers, _body| {
+                    if headers.any(|(k, v)| k == "cookie" && v == "a=caf\u{FFFD}") {
+                        AclClassification::Denied("cookie seen".to_string())
+                    } else {
+                        AclClassification::AllowedDefault
+                    }
+                })),
+                ..Default::default()
+            },
+            HttpAcl::builder(),
+        );
+
+        let request = client
+            .get("http://127.0.0.1:9/")
+            .header("cookie", HeaderValue::from_bytes(b"a=caf\xE9").unwrap())
+            .send()
+            .await;
+
+        let error = request.unwrap_err().to_string();
+        assert!(error.contains("cookie seen"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_modify_request_keeps_obs_text_header_bytes() {
+        let (addr, captured_rx) = capture_server(OK_EMPTY).await;
+        let client = local_client(
+            HttpAclHooks {
+                modify_request_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+                    mutation.headers.retain(|(k, _)| k != "x-drop-me");
+                    mutation
+                        .headers
+                        .push(("x-injected".to_string(), "yes".to_string()));
+                })),
+                ..Default::default()
+            },
+            HttpAcl::builder(),
+        );
+
+        let request = client
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .header("cookie", HeaderValue::from_bytes(b"a=caf\xE9").unwrap())
+            .header("x-drop-me", HeaderValue::from_bytes(b"caf\xE9").unwrap())
+            .send()
+            .await;
+
+        assert!(request.is_ok(), "{:?}", request.err());
+        let captured = captured_rx.await.unwrap();
+        assert!(
+            contains(&captured, b"cookie: a=caf\xE9\r\n"),
+            "{captured:?}"
+        );
+        assert!(contains(&captured, b"x-injected: yes\r\n"), "{captured:?}");
+        assert!(!contains(&captured, b"x-drop-me"), "{captured:?}");
+    }
+
+    #[tokio::test]
+    async fn test_modify_response_keeps_obs_text_header_bytes() {
+        let (addr, _captured_rx) =
+            capture_server(b"HTTP/1.1 200 OK\r\nx-raw: caf\xE9\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        let client = local_client(
+            HttpAclHooks {
+                modify_response_fn: Some(Arc::new(|_scheme, _authority, mutation| {
+                    mutation.body = Bytes::from_static(b"changed");
+                })),
+                ..Default::default()
+            },
+            HttpAcl::builder(),
+        );
+
+        let response = client
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("x-raw").unwrap().as_bytes(),
+            b"caf\xE9"
+        );
+        assert_eq!(response.text().await.unwrap(), "changed");
     }
 }
