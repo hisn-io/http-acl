@@ -266,6 +266,54 @@ mod tests {
     }
 
     #[test]
+    fn header_acl_bytes_compares_raw_bytes() {
+        // U+FFFD is what a lossy UTF-8 decode turns a stray 0xE9 into, so an
+        // allow-listed value containing it is the case a lossy comparison would let
+        // a different raw byte sequence through.
+        let acl = HttpAclBuilder::new()
+            .add_allowed_header("x-allowed".to_string(), Some("caf\u{FFFD}".to_string()))
+            .unwrap()
+            .add_allowed_header("x-any".to_string(), None)
+            .unwrap()
+            .add_denied_header("x-denied".to_string(), None)
+            .unwrap()
+            .add_denied_header("x-denied-value".to_string(), Some("caf\u{e9}".to_string()))
+            .unwrap()
+            .header_acl_default(false)
+            .try_build()
+            .unwrap();
+
+        assert!(
+            acl.is_header_allowed_bytes("x-allowed", "caf\u{FFFD}".as_bytes())
+                .is_allowed()
+        );
+        assert!(
+            acl.is_header_allowed_bytes("x-allowed", b"caf\xE9")
+                .is_denied()
+        );
+        assert!(
+            acl.is_header_allowed_bytes("x-any", b"caf\xE9")
+                .is_allowed()
+        );
+        assert!(
+            acl.is_header_allowed_bytes("x-denied", b"caf\xE9")
+                .is_denied()
+        );
+        assert!(
+            acl.is_header_allowed_bytes("x-denied-value", "caf\u{e9}".as_bytes())
+                .is_denied()
+        );
+        assert!(
+            acl.is_header_allowed_bytes("x-denied-value", b"caf\xE9")
+                .is_allowed()
+        );
+        assert!(
+            acl.is_header_allowed_bytes("x-other", b"caf\xE9")
+                .is_denied()
+        );
+    }
+
+    #[test]
     fn static_dns_mapping() {
         let regular_addr = "10.0.0.1:80".parse().unwrap();
         let trusted_addr = "10.0.0.2:80".parse().unwrap();

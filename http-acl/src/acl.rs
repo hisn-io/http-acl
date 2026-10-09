@@ -323,14 +323,34 @@ impl HttpAcl {
     ///
     /// Note: Header names are case-insensitive, but this function assumes the caller provides them in a consistent case.
     pub fn is_header_allowed(&self, header_name: &str, header_value: &str) -> AclClassification {
+        self.is_header_allowed_bytes(header_name, header_value.as_bytes())
+    }
+
+    /// Returns whether a header is allowed, given its value as raw bytes.
+    ///
+    /// The same check as [`HttpAcl::is_header_allowed`], for header values that are
+    /// not valid UTF-8 (RFC 9110 `obs-text`, bytes 0x80-0xFF). A configured value is
+    /// compared byte for byte, never against a lossy decode, so a value that only
+    /// decodes lossily to an allowed value (e.g. via U+FFFD) does not match it.
+    ///
+    /// Note: Header names are case-insensitive, but this function assumes the caller provides them in a consistent case.
+    pub fn is_header_allowed_bytes(
+        &self,
+        header_name: &str,
+        header_value: &[u8],
+    ) -> AclClassification {
         if let Some(allowed_value) = self.allowed_headers.get(header_name) {
-            if allowed_value.as_deref() == Some(header_value) || allowed_value.is_none() {
+            if allowed_value.as_deref().map(str::as_bytes) == Some(header_value)
+                || allowed_value.is_none()
+            {
                 AclClassification::AllowedUserAcl
             } else {
                 AclClassification::DeniedUserAcl
             }
         } else if let Some(denied_value) = self.denied_headers.get(header_name) {
-            if denied_value.as_deref() == Some(header_value) || denied_value.is_none() {
+            if denied_value.as_deref().map(str::as_bytes) == Some(header_value)
+                || denied_value.is_none()
+            {
                 AclClassification::DeniedUserAcl
             } else {
                 AclClassification::AllowedUserAcl
