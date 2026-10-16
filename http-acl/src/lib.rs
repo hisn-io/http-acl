@@ -181,6 +181,67 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_embedding_ipv6_denied_by_default() {
+        // hisn-io/hisn#2821: each of these IPv6 forms carries an IPv4 address, so it can
+        // name loopback or a private network and must be as closed as that range.
+        let probes = [
+            "::7f00:1",           // IPv4-compatible ::/96, 127.0.0.1
+            "::a00:1",            // IPv4-compatible ::/96, 10.0.0.1
+            "::808:808",          // IPv4-compatible ::/96, 8.8.8.8
+            "64:ff9b::7f00:1",    // NAT64 64:ff9b::/96, 127.0.0.1
+            "64:ff9b::a9fe:a9fe", // NAT64 64:ff9b::/96, 169.254.169.254
+            "2002:7f00:1::",      // 6to4 2002::/16, 127.0.0.1
+            "2002:c0a8:101::1",   // 6to4 2002::/16, 192.168.1.1
+            "::ffff:0:7f00:1",    // IPv4-translated ::ffff:0:0:0/96, 127.0.0.1
+            "::ffff:7f00:1",      // IPv4-mapped ::ffff:0:0/96, already denied
+            "64:ff9b:1::7f00:1",  // local-use translation 64:ff9b:1::/48, already denied
+        ];
+
+        let acl = HttpAclBuilder::new()
+            .ip_acl_default(true)
+            .try_build()
+            .unwrap();
+        for probe in probes {
+            assert!(
+                acl.is_ip_allowed(&probe.parse().unwrap()).is_denied(),
+                "{probe} should be denied"
+            );
+        }
+        assert!(
+            acl.is_ip_allowed(&"2606:4700:4700::1111".parse().unwrap())
+                .is_allowed()
+        );
+
+        let acl = HttpAclBuilder::new()
+            .non_global_ip_ranges(true)
+            .ip_acl_default(true)
+            .try_build()
+            .unwrap();
+        for probe in probes {
+            assert!(
+                acl.is_ip_allowed(&probe.parse().unwrap()).is_allowed(),
+                "{probe} should be allowed with non-global ranges on"
+            );
+        }
+
+        for range in [
+            "::7f00:0/104",
+            "64:ff9b::/96",
+            "2002::/16",
+            "::ffff:0:0:0/96",
+        ] {
+            assert!(
+                HttpAclBuilder::new()
+                    .add_allowed_ip_range(range.parse::<IpNet>().unwrap())
+                    .unwrap()
+                    .try_build()
+                    .is_err(),
+                "{range} should be refused as an allowed range"
+            );
+        }
+    }
+
+    #[test]
     fn non_global_ip_acl() {
         let acl = HttpAclBuilder::new()
             .non_global_ip_ranges(true)

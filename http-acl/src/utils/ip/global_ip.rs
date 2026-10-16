@@ -205,6 +205,8 @@ mod ipv6_global {
     /// - The [unspecified address] ([`is_unspecified`](Ipv6Addr::is_unspecified))
     /// - The [loopback address] ([`is_loopback`](Ipv6Addr::is_loopback))
     /// - IPv4-mapped addresses
+    /// - IPv4-compatible, IPv4-translated, NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`)
+    ///   addresses, which embed an IPv4 address
     /// - Addresses reserved for benchmarking
     /// - Addresses reserved for documentation ([`is_documentation`](Ipv6Addr::is_documentation))
     /// - Unique local addresses ([`is_unique_local`](Ipv6Addr::is_unique_local))
@@ -230,6 +232,17 @@ mod ipv6_global {
             || matches!(a.segments(), [0, 0, 0, 0, 0, 0xffff, _, _])
             // IPv4-IPv6 Translat. (`64:ff9b:1::/48`)
             || matches!(a.segments(), [0x64, 0xff9b, 1, _, _, _, _, _])
+            // The ranges below embed an IPv4 address, so any of them can name loopback or a
+            // private network. IANA does not list them all as non-global, but they are denied
+            // here as a whole, whatever the embedded address (hisn-io/hisn#2821).
+            // IPv4-compatible Address (`::/96`, deprecated by RFC 4291)
+            || matches!(a.segments(), [0, 0, 0, 0, 0, 0, _, _])
+            // IPv4-translated Address (`::ffff:0:0:0/96`, RFC 2765)
+            || matches!(a.segments(), [0, 0, 0, 0, 0xffff, 0, _, _])
+            // IPv4-IPv6 Translat. well-known prefix (`64:ff9b::/96`, RFC 6052)
+            || matches!(a.segments(), [0x64, 0xff9b, 0, 0, 0, 0, _, _])
+            // 6to4 (`2002::/16`, deprecated by RFC 7526)
+            || matches!(a.segments(), [0x2002, _, _, _, _, _, _, _])
             // Discard-Only Address Block (`100::/64`)
             || matches!(a.segments(), [0x100, 0, 0, 0, _, _, _, _])
             // IETF Protocol Assignments (`2001::/23`)

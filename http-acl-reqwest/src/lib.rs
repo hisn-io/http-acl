@@ -462,7 +462,9 @@ impl Resolve for GaiResolver {
 /// [`HttpAclBuilder::add_trusted_static_dns_mapping`]) is returned as-is; a regular
 /// static mapping or a genuinely resolved address is
 /// filtered through [`HttpAcl::is_ip_allowed`] and [`HttpAcl::is_port_allowed`], so
-/// only addresses the ACL permits are ever handed to `reqwest`. Constructed via
+/// only addresses the ACL permits are ever handed to `reqwest`. An address with port 0
+/// skips the port check, since the connector gives it the URL's port, which the
+/// middleware checks. Constructed via
 /// [`HttpAclMiddleware::dns_resolver`] or [`HttpAclMiddleware::with_dns_resolver`],
 /// not directly.
 pub struct HttpAclDnsResolver {
@@ -517,7 +519,7 @@ impl Resolve for HttpAclDnsResolver {
                 // entirely (e.g. mapping a host to a private IP while non-global IPs
                 // are denied).
                 if acl.is_ip_allowed(&tcp_address.ip()).is_allowed()
-                    && acl.is_port_allowed(tcp_address.port()).is_allowed()
+                    && is_resolved_port_allowed(&acl, tcp_address.port())
                 {
                     Ok(Box::new(std::iter::once(tcp_address))
                         as Box<dyn Iterator<Item = SocketAddr> + Send>)
@@ -534,7 +536,7 @@ impl Resolve for HttpAclDnsResolver {
                             .into_iter()
                             .filter(|addr| {
                                 acl.is_ip_allowed(&addr.ip()).is_allowed()
-                                    && acl.is_port_allowed(addr.port()).is_allowed()
+                                    && is_resolved_port_allowed(&acl, addr.port())
                             })
                             .collect::<Vec<_>>();
                         Ok(Box::new(filtered.into_iter())
@@ -545,6 +547,14 @@ impl Resolve for HttpAclDnsResolver {
             }
         })
     }
+}
+
+/// Checks the port of a resolved address. Port 0, which every `getaddrinfo` answer
+/// carries, is not checked: the connector replaces it with the URL's port, and the
+/// middleware checks that one. A non-zero port is checked, because the connector uses it
+/// when the URL names no port of its own (hisn-io/hisn#2821).
+fn is_resolved_port_allowed(acl: &HttpAcl, port: u16) -> bool {
+    port == 0 || acl.is_port_allowed(port).is_allowed()
 }
 
 #[derive(Error, Debug)]
@@ -649,6 +659,46 @@ mod tests {
             acl_err,
             HttpAclError::HostDenied { host } if host == "denied.example.com"
         ));
+    }
+
+    /// Answers every name with fixed addresses, as a stub for `getaddrinfo`.
+    struct FixedResolver(Vec<SocketAddr>);
+
+    impl Resolve for FixedResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            let addresses = self.0.clone();
+            Box::pin(async move {
+                Ok(Box::new(addresses.into_iter()) as Box<dyn Iterator<Item = SocketAddr> + Send>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dns_resolver_keeps_port_zero_answers() {
+        // hisn-io/hisn#2794, #2821: `getaddrinfo` answers carry port 0, and the connector
+        // replaces port 0 with the URL's port, which the middleware checks. Checking port 0
+        // against an ACL that allows only 80 and 443 dropped every resolved address, so no
+        // hostname could be fetched.
+        let acl = HttpAcl::builder()
+            .ip_acl_default(true)
+            .host_acl_default(true)
+            .build();
+        let middleware = HttpAclMiddleware::new(acl);
+        let resolver = middleware.with_dns_resolver(Arc::new(FixedResolver(vec![
+            "1.1.1.1:0".parse().unwrap(),
+            "1.1.1.1:22".parse().unwrap(),
+            "[64:ff9b::7f00:1]:0".parse().unwrap(),
+        ])));
+
+        let name: Name = "jwks.example.com".parse().unwrap();
+        let addresses = match resolver.resolve(name).await {
+            Ok(addresses) => addresses.collect::<Vec<_>>(),
+            Err(e) => panic!("expected resolution to succeed: {e}"),
+        };
+
+        // A non-zero port is the one the connector uses when the URL has none, so it is
+        // still checked; a denied IP is dropped whatever its port.
+        assert_eq!(addresses, vec!["1.1.1.1:0".parse::<SocketAddr>().unwrap()]);
     }
 
     #[tokio::test]
