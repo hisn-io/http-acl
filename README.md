@@ -17,7 +17,7 @@ This crate provides a simple ACL to allow you to specify which hosts, ports, and
 
 An `HttpAcl` can check a request's scheme, method, host, port, IP, headers, and URL path, plus any custom logic you supply as a `ValidateFn`, and optionally mutate the request/response themselves via a `ModifyRequestFn`/`ModifyResponseFn` (see [Modifying requests and responses](#modifying-requests-and-responses) below). Each of these (other than scheme, which is a simple allow/deny flag per protocol) is evaluated the same way: the allow list is checked first, then the deny list, and if neither matches, a per-category default decides the outcome. Methods, hosts, ports, and IPs deny by default; headers and URL paths allow by default. Every check returns an `AclClassification` rather than a plain boolean, so you can see why a request was allowed or denied, not just whether it was; call `.is_allowed()`/`.is_denied()` on it once only the outcome matters.
 
-Non-global IP addresses (private, loopback, link-local, and other special-use ranges) are denied outright regardless of the IP allow/deny lists, unless you opt in with `.non_global_ip_ranges(true)` on the builder.
+Non-global IP addresses (private, loopback, link-local, other special-use ranges, and the IPv6 ranges that embed an IPv4 address: `::/96`, `::ffff:0:0/96`, `::ffff:0:0:0/96`, `64:ff9b::/96`, `64:ff9b:1::/48` and `2002::/16`) are denied outright regardless of the IP allow/deny lists, unless you opt in with `.non_global_ip_ranges(true)` on the builder.
 
 ## Usage
 
