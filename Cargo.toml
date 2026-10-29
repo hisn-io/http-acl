@@ -1,5 +1,5 @@
 [workspace]
-members = ["http-acl", "http-acl-reqwest"]
+members = ["http-acl", "http-acl-reqwest", "http-acl-wasmtime"]
 resolver = "2"
 
 [workspace.package]

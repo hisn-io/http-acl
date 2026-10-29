@@ -1,6 +1,17 @@
 # Changelog
 
-Both crates, `http-acl` and `http-acl-reqwest`, share one version.
+The crates, `http-acl`, `http-acl-reqwest` and `http-acl-wasmtime`, share one version.
+
+## Unreleased
+
+### Added
+
+- `http-acl-wasmtime`: the ACL for wasmtime-wasi-http 36's outgoing requests, through its
+  overridable `WasiHttpView::send_request`. `check_request` checks the method, scheme, port
+  and decoded URL path; `send_request_handler` checks the host, resolves it and checks every
+  address the resolver returns before connecting, and applies the request and response
+  rewrite hooks. It replaces the http-acl patch carried in the hisn-io/wasmtime fork
+  (hisn-io/hisn#3638), so the fork is no longer needed.
 
 ## 0.14.0 (2026-10-16)
 
