@@ -21,7 +21,7 @@ rustls = "0.23.46"
 tokio = { workspace = true, features = ["net", "time"] }
 tokio-rustls = "0.26.4"
 tracing = "0.1.44"
-wasmtime-wasi = { version = "36.0.19", default-features = false }
+wasmtime-wasi = { version = "50.0.0", default-features = false }
 wasmtime-wasi-http = { version = "36.0.19", default-features = false }
 webpki-roots = "0.26.11"
 
